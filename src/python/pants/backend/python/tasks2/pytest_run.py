@@ -19,12 +19,15 @@ from six.moves import configparser
 
 from pants.backend.python.subsystems.pytest import PyTest
 from pants.backend.python.targets.python_tests import PythonTests
+from pants.backend.python.tasks2.partition_targets import PartitionTargets
 from pants.backend.python.tasks2.gather_sources import GatherSources
 from pants.backend.python.tasks2.python_execution_task_base import PythonExecutionTaskBase
+from pants.backend.python.tasks2.python_task_mixin import PythonTaskMixin
 from pants.base.build_environment import get_buildroot
 from pants.base.exceptions import ErrorWhileTesting, TaskError
 from pants.base.hash_utils import Sharder
 from pants.base.workunit import WorkUnitLabel
+from pants.build_graph.address import Address
 from pants.build_graph.target import Target
 from pants.task.testrunner_task_mixin import TestRunnerTaskMixin
 from pants.util.contextutil import temporary_dir, temporary_file
@@ -63,7 +66,8 @@ class PythonTestResult(object):
     return self._failed_targets
 
 
-class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
+class PytestRun(TestRunnerTaskMixin, PythonTaskMixin, PythonExecutionTaskBase):
+  FAST_TARGET_ADDRESS = Address.parse('//:__pytest_fast__')
 
   @classmethod
   def subsystem_dependencies(cls):
@@ -72,10 +76,16 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
   @classmethod
   def register_options(cls, register):
     super(PytestRun, cls).register_options(register)
-    register('--fast', type=bool, default=True,
-             help='Run all tests in a single pytest invocation. If turned off, each test target '
-                  'will run in its own pytest invocation, which will be slower, but isolates '
-                  'tests from process-wide state created by tests in other targets.')
+    # register('--single-root', type=bool, default=False,
+    #          help='Creates a single source root for all tests. This can speed up testing when '
+    #               '--test-pytest-run-per-target is disabled. When this flag is turned off, '
+    #               'multiple source roots will be created. This is useful when the test targets may '
+    #               'have conflicting interpreter or requirements constraints.')
+    register('--run-per-target', type=bool, default=False,
+             help='Invoke pytest for each target separately. This is slower, but isolates tests '
+                  'from process-wide state created by tests in other targets. If turned off, '
+                  'pytest will be invoked once for each source root which may contain multiple '
+                  'test targets. See --test-pytest-single-root.')
     register('--junit-xml-dir', metavar='<DIR>',
              help='Specifying a directory causes junit xml results files to be emitted under '
                   'that dir for each test run.')
@@ -96,6 +106,26 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
              help='Subset of tests to run, in the form M/N, 0 <= M < N. For example, 1/3 means '
                   'run tests number 2, 5, 8, 11, ...')
 
+  # @classmethod
+  # def get_alternate_target_roots(cls, options, address_mapper, build_graph):
+  #   # EXPLAIN WHY we override this, since we want the global options.
+  #   scoped_options = cls._scoped_options(options)
+  #   if scoped_options.single_root:
+  #     python_tests_addresses = []
+  #     everything_else = []
+  #     for spec in options.target_specs:
+  #         target = build_graph.get_target_from_spec(spec)
+  #         if isinstance(target, PythonTests):
+  #           python_tests_addresses.append(Address.parse(spec))
+  #         else:
+  #           everything_else.append(target)
+  #     build_graph.inject_synthetic_target(
+  #         address=cls.FAST_TARGET_ADDRESS,
+  #         target_type=PythonTests,
+  #         dependencies=python_tests_addresses,
+  #         )
+  #     return [build_graph.resolve_address(cls.FAST_TARGET_ADDRESS)] + everything_else
+
   @classmethod
   def supports_passthru_args(cls):
     return True
@@ -108,7 +138,7 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
 
   def _test_target_filter(self):
     def target_filter(target):
-      return isinstance(target, PythonTests)
+      return isinstance(target, PythonTests) and target in self.context.target_roots
 
     return target_filter
 
@@ -216,8 +246,7 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
       yield []
       return
 
-    pex_src_root = os.path.relpath(
-      self.context.products.get_data(GatherSources.PYTHON_SOURCES).path(), get_buildroot())
+    pex_src_root = os.path.relpath(self._pex_for_targets(targets).path(), get_buildroot())
 
     source_mappings = {}
     for target in targets:
@@ -393,7 +422,7 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
   def _test_runner(self, targets, sources_map):
     pex_info = PexInfo.default()
     pex_info.entry_point = 'pytest'
-    pex = self.create_pex(pex_info)
+    pex = self.create_pex(self.group_id_for_targets(targets), pex_info)
 
     with self._conftest(sources_map) as conftest:
       with self._maybe_emit_coverage_data(targets, pex) as coverage_args:
@@ -435,9 +464,12 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
       self.context.log.info(traceback.format_exc())
       return PythonTestResult.exception()
 
+  def _pex_for_targets(self, targets):
+    return self.context.products.get_data(GatherSources.PYTHON_SOURCES)[
+        self.group_id_for_targets(targets)]
+
   def _map_relsrc_to_targets(self, targets):
-    pex_src_root = os.path.relpath(
-      self.context.products.get_data(GatherSources.PYTHON_SOURCES).path(), get_buildroot())
+    pex_src_root = os.path.relpath(self._pex_for_targets(targets).path(), get_buildroot())
     # First map chrooted sources back to their targets.
     relsrc_to_target = {os.path.join(pex_src_root, src): target for target in targets
       for src in target.sources_relative_to_source_root()}
@@ -475,11 +507,30 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
     file_info = test_info['file']
     return relsrc_to_target.get(file_info)
 
+  def _split_targets_to_groups(self, targets):
+    partition = self.context.products.get_data(PartitionTargets.TARGETS_PARTITION)
+    result = []
+    groups_by_group_id = {}
+    for target in targets:
+      group_id = partition.ids_by_target[target]
+      if group_id in groups_by_group_id:
+        group = groups_by_group_id[group_id]
+      else:
+        group = groups_by_group_id[group_id] = []
+        result.append(group)
+      group.append(target)
+    return result
+
   def _run_tests(self, targets):
-    if self.get_options().fast:
-      result = self._do_run_tests(targets)
-      if not result.success:
-        raise ErrorWhileTesting(failed_targets=result.failed_targets)
+    if not self.get_options().run_per_target:
+      failed_targets = []
+      for group in self._split_targets_to_groups(targets):
+        rv = self._do_run_tests(group)
+        if not rv.success:
+          if self.get_options().fail_fast:
+            raise ErrorWhileTesting(failed_targets=rv.failed_targets)
+          else:
+            failed_targets.extend(rv.failed_targets)
     else:
       results = {}
       for target in targets:
@@ -490,8 +541,9 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
       for target in sorted(results):
         self.context.log.info('{0:80}.....{1:>10}'.format(target.id, str(results[target])))
       failed_targets = [target for target, _rv in results.items() if not _rv.success]
-      if failed_targets:
-        raise ErrorWhileTesting(failed_targets=failed_targets)
+
+    if failed_targets:
+      raise ErrorWhileTesting(failed_targets=failed_targets)
 
   def _do_run_tests(self, targets):
     if not targets:
@@ -499,7 +551,7 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
 
     buildroot = get_buildroot()
     source_chroot = os.path.relpath(
-      self.context.products.get_data(GatherSources.PYTHON_SOURCES).path(), buildroot)
+       self._pex_for_targets(targets).path(), buildroot)
     sources_map = {}  # Path from chroot -> Path from buildroot.
     for t in targets:
       for p in t.sources_relative_to_source_root():
@@ -530,7 +582,7 @@ class PytestRun(TestRunnerTaskMixin, PythonExecutionTaskBase):
       for options in self.get_options().options + self.get_passthru_args():
         args.extend(safe_shlex_split(options))
       args.extend(test_args)
-      args.extend(sources_map.keys())
+      args.extend(sorted(sources_map.keys()))
 
       result = self._do_run_tests_with_args(pex, args)
       external_junit_xml_dir = self.get_options().junit_xml_dir

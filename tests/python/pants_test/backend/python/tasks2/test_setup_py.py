@@ -15,6 +15,8 @@ from twitter.common.collections import OrderedSet
 from twitter.common.dirutil.chroot import Chroot
 
 from pants.backend.python.tasks2.setup_py import SetupPy
+from pants.backend.python.tasks2.partition_targets import PartitionTargets, TargetsPartition
+from pants.backend.python.tasks2.select_interpreter import SelectInterpreter
 from pants.base.exceptions import TaskError
 from pants.build_graph.build_file_aliases import BuildFileAliases
 from pants.build_graph.prep_command import PrepCommand
@@ -84,6 +86,13 @@ class TestSetupPy(PythonTaskTestBase):
   def run_execute(self, target, recursive=False):
     self.set_options(recursive=recursive)
     context = self.context(target_roots=[target])
+
+    partition = TargetsPartition.create_from_groups([[target]])
+    context.products.get_data(PartitionTargets.TARGETS_PARTITION, lambda: partition)
+    context.products.get_data(
+        SelectInterpreter.PYTHON_INTERPRETERS,
+        lambda: {group_id: None for group_id in partition.group_ids()})
+
     setup_py = self.create_task(context)
     setup_py.execute()
     yield context.products.get_data(SetupPy.PYTHON_DISTS_PRODUCT)

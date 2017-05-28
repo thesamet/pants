@@ -13,6 +13,7 @@ from pex.interpreter import PythonIdentity, PythonInterpreter
 from pants.backend.python.interpreter_cache import PythonInterpreterCache
 from pants.backend.python.subsystems.python_setup import PythonSetup
 from pants.backend.python.targets.python_target import PythonTarget
+from pants.backend.python.tasks2.partition_targets import PartitionTargets
 from pants.base.fingerprint_strategy import DefaultFingerprintHashingMixin, FingerprintStrategy
 from pants.invalidation.cache_manager import VersionedTargetSet
 from pants.python.python_repos import PythonRepos
@@ -38,36 +39,51 @@ class PythonInterpreterFingerprintStrategy(DefaultFingerprintHashingMixin, Finge
 
 
 class SelectInterpreter(Task):
-  """Select an Python interpreter that matches the constraints of all targets in the working set."""
+  """Select a Python interpreter for each root target.
+
+  Produces under PYTHON_INTERPRETERS a mapping between target roots and interpreters
+  that matches the transitive constraints of these targets."""
+  PYTHON_INTERPRETERS = 'PYTHON_INTERPRETERS'
 
   @classmethod
   def subsystem_dependencies(cls):
     return super(SelectInterpreter, cls).subsystem_dependencies() + (PythonSetup, PythonRepos)
 
   @classmethod
+  def prepare(cls, options, round_manager):
+    round_manager.require_data(PartitionTargets.TARGETS_PARTITION)
+
+  @classmethod
   def product_types(cls):
-    return [PythonInterpreter]
+    return [cls.PYTHON_INTERPRETERS]
 
   def execute(self):
-    interpreter = None
-    python_tgts = self.context.targets(lambda tgt: isinstance(tgt, PythonTarget))
     fs = PythonInterpreterFingerprintStrategy()
-    with self.invalidated(python_tgts, fingerprint_strategy=fs) as invalidation_check:
-      # If there are no relevant targets, we still go through the motions of selecting
-      # an interpreter, to prevent downstream tasks from having to check for this special case.
-      if invalidation_check.all_vts:
-        target_set_id = VersionedTargetSet.from_versioned_targets(
-            invalidation_check.all_vts).cache_key.hash
-      else:
-        target_set_id = 'no_targets'
-      interpreter_path_file = self._interpreter_path_file(target_set_id)
-      if not os.path.exists(interpreter_path_file):
-        self._create_interpreter_path_file(interpreter_path_file, python_tgts)
 
-    if not interpreter:
-      interpreter = self._get_interpreter(interpreter_path_file)
+    def _get_interpreter_for_target_set(target_set):
+      python_tgts = filter(lambda tgt: isinstance(tgt, PythonTarget), target_set)
+      with self.invalidated(python_tgts, fingerprint_strategy=fs) as invalidation_check:
+        # If there are no relevant targets, we still go through the motions of selecting
+        # an interpreter, to prevent downstream tasks from having to check for this special case.
+        if invalidation_check.all_vts:
+          target_set_id = VersionedTargetSet.from_versioned_targets(
+              invalidation_check.all_vts).cache_key.hash
+        else:
+          target_set_id = 'no_targets'
+        interpreter_path_file = self._interpreter_path_file(target_set_id)
+        if not os.path.exists(interpreter_path_file):
+          self._create_interpreter_path_file(interpreter_path_file, target_set)
 
-    self.context.products.get_data(PythonInterpreter, lambda: interpreter)
+      return self._get_interpreter(interpreter_path_file)
+
+    partition = self.context.products.get_data(PartitionTargets.TARGETS_PARTITION)
+    if self.context.products.is_required_data(self.PYTHON_INTERPRETERS):
+      interpreters = self.context.products.get_data(
+          self.PYTHON_INTERPRETERS,
+          lambda: {})
+      for group_id in partition.group_ids():
+          interpreters[group_id] = _get_interpreter_for_target_set(partition.closure_for_group_id(
+              group_id))
 
   @memoized_method
   def _interpreter_cache(self):
